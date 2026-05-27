@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -24,6 +25,106 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_openai_response_output_none(response: Any) -> Any:
+    """Return a response-like object whose ``output`` is never ``None``.
+
+    The OpenAI SDK's ``parse_response()`` still unconditionally iterates
+    ``response.output`` in 2.24.0 through at least 2.38.0. Some Codex backend
+    responses now surface ``output=None`` on the final accumulated response,
+    which crashes inside the SDK before Hermes can run its own output backfill.
+    """
+
+    if response is None or getattr(response, "output", None) is not None:
+        return response
+
+    model_copy = getattr(response, "model_copy", None)
+    if callable(model_copy):
+        try:
+            copied = model_copy(update={"output": []})
+            if getattr(copied, "output", None) is not None:
+                return copied
+        except Exception:
+            logger.debug("Codex parse_response guard: model_copy(update=...) failed", exc_info=True)
+
+    try:
+        setattr(response, "output", [])
+        if getattr(response, "output", None) is not None:
+            return response
+    except Exception:
+        logger.debug("Codex parse_response guard: setattr(response, 'output', []) failed", exc_info=True)
+
+    payload = {}
+    try:
+        payload.update(getattr(response, "__dict__", {}) or {})
+    except Exception:
+        logger.debug("Codex parse_response guard: response.__dict__ copy failed", exc_info=True)
+    payload["output"] = []
+    return SimpleNamespace(**payload)
+
+
+def _build_openai_parse_response_none_output_guard(original_parse_response):
+    if getattr(original_parse_response, "_hermes_none_output_guard", False):
+        return original_parse_response
+
+    def _guarded_parse_response(*args, **kwargs):
+        if "response" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["response"] = _coerce_openai_response_output_none(kwargs.get("response"))
+            return original_parse_response(*args, **kwargs)
+        if len(args) >= 3:
+            args = list(args)
+            args[2] = _coerce_openai_response_output_none(args[2])
+            return original_parse_response(*args, **kwargs)
+        return original_parse_response(*args, **kwargs)
+
+    _guarded_parse_response.__name__ = getattr(original_parse_response, "__name__", "parse_response")
+    _guarded_parse_response.__qualname__ = getattr(original_parse_response, "__qualname__", _guarded_parse_response.__name__)
+    _guarded_parse_response.__doc__ = getattr(original_parse_response, "__doc__", None)
+    _guarded_parse_response._hermes_none_output_guard = True
+    _guarded_parse_response._hermes_original = original_parse_response
+    return _guarded_parse_response
+
+
+def _patch_openai_parse_response_none_output_guard() -> bool:
+    """Monkey-patch all known OpenAI SDK ``parse_response`` aliases.
+
+    The streaming module imports ``parse_response`` directly from
+    ``openai.lib._parsing._responses`` at import time, so patching only the
+    source module is not enough once the SDK's streaming helpers are already
+    imported.
+    """
+
+    module_names = [
+        "openai.lib._parsing._responses",
+        "openai.lib.streaming.responses._responses",
+        "openai.resources.responses.responses",
+    ]
+    guarded = None
+    patched = False
+
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        current = getattr(module, "parse_response", None)
+        if current is None:
+            continue
+        if getattr(current, "_hermes_none_output_guard", False):
+            guarded = current
+            continue
+        guarded = guarded or _build_openai_parse_response_none_output_guard(current)
+        setattr(module, "parse_response", guarded)
+        patched = True
+
+    if patched:
+        logger.debug("Installed Hermes guard for OpenAI parse_response(output=None)")
+    return guarded is not None
+
+
+_patch_openai_parse_response_none_output_guard()
 
 
 def run_codex_app_server_turn(
@@ -45,6 +146,7 @@ def run_codex_app_server_turn(
     from agent.transports.codex_app_server_session import CodexAppServerSession
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
+
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
